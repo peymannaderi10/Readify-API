@@ -23,35 +23,11 @@ export function createApp() {
   }));
 
   // CORS configuration
+  // Note: For Chrome extensions, content scripts run in the web page context,
+  // so the Origin header is the page's origin (e.g., wikipedia.org), not the extension.
+  // Security is enforced via JWT authentication, not CORS origin checking.
   const corsOptions = {
-    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-      // Allow requests with no origin (like mobile apps, curl, etc.)
-      if (!origin) {
-        callback(null, true);
-        return;
-      }
-
-      // Allow Chrome extension origins
-      if (origin.startsWith('chrome-extension://')) {
-        callback(null, true);
-        return;
-      }
-
-      // Allow specific frontend URLs
-      if (env.FRONTEND_URL && origin === env.FRONTEND_URL) {
-        callback(null, true);
-        return;
-      }
-
-      // Allow localhost in development
-      if (isDev && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
-        callback(null, true);
-        return;
-      }
-
-      // Block other origins
-      callback(new Error('Not allowed by CORS'));
-    },
+    origin: true, // Allow all origins - security is handled by JWT auth on protected routes
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
