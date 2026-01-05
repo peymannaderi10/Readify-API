@@ -10,7 +10,7 @@
  * @see https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html
  */
 
-import rateLimit, { Options } from 'express-rate-limit';
+import rateLimit, { Options, ipKeyGenerator } from 'express-rate-limit';
 import { Request, Response } from 'express';
 
 // ============================================
@@ -18,23 +18,33 @@ import { Request, Response } from 'express';
 // ============================================
 
 /**
- * Custom key generator that uses user ID for authenticated requests,
- * falls back to IP for unauthenticated requests.
+ * Normalize an IP address for rate limiting.
+ * Uses express-rate-limit's ipKeyGenerator for proper IPv6 handling.
+ * 
+ * @param req - Express request object
+ * @returns Normalized IP string suitable for rate limiting
  */
-const userOrIpKeyGenerator = (req: Request): string => {
-  // Use user ID if authenticated (provides per-user limiting)
-  if (req.user?.id) {
-    return `user:${req.user.id}`;
-  }
-  // Fall back to IP address
-  return `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+const normalizeIp = (req: Request): string => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  // Use the library's helper to properly normalize IPv6 addresses
+  return ipKeyGenerator(ip);
 };
 
 /**
- * IP-only key generator for endpoints that should be limited by IP regardless of auth
+ * Custom key generator that uses user ID for authenticated requests,
+ * falls back to normalized IP for unauthenticated requests.
+ * 
+ * For authenticated users: Uses user ID (consistent regardless of IP)
+ * For unauthenticated: Uses normalized IP with proper IPv6 handling
  */
-const ipOnlyKeyGenerator = (req: Request): string => {
-  return `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
+const userOrIpKeyGenerator = (req: Request): string => {
+  // Use user ID if authenticated (provides per-user limiting)
+  // This is the primary key for authenticated routes - no IP needed
+  if (req.user?.id) {
+    return `user:${req.user.id}`;
+  }
+  // Fall back to normalized IP address for unauthenticated requests
+  return `ip:${normalizeIp(req)}`;
 };
 
 /**
@@ -72,12 +82,13 @@ const commonOptions: Partial<Options> = {
  * Prevents basic DoS attacks
  * 
  * Limit: 100 requests per minute per IP
+ * Uses default keyGenerator which handles IPv6 properly
  */
 export const globalRateLimiter = rateLimit({
   ...commonOptions,
   windowMs: 60 * 1000, // 1 minute
   max: 100, // 100 requests per minute
-  keyGenerator: ipOnlyKeyGenerator,
+  // Default keyGenerator uses req.ip with proper IPv6 handling
   message: 'Too many requests from this IP, please try again later.',
 });
 
@@ -86,12 +97,13 @@ export const globalRateLimiter = rateLimit({
  * Prevents brute-force attacks on authentication
  * 
  * Limit: 5 attempts per 15 minutes per IP
+ * Uses default keyGenerator which handles IPv6 properly
  */
 export const authRateLimiter = rateLimit({
   ...commonOptions,
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5, // 5 attempts per 15 minutes
-  keyGenerator: ipOnlyKeyGenerator,
+  // Default keyGenerator uses req.ip with proper IPv6 handling
   message: 'Too many authentication attempts, please try again later.',
 });
 
@@ -156,12 +168,12 @@ export const stripeRateLimiter = rateLimit({
  * Higher limits since webhooks come from trusted services (Stripe)
  * 
  * Limit: 100 requests per minute per IP
+ * Uses default keyGenerator which handles IPv6 properly
  */
 export const webhookRateLimiter = rateLimit({
   ...commonOptions,
   windowMs: 60 * 1000, // 1 minute
   max: 100, // 100 webhooks per minute
-  keyGenerator: ipOnlyKeyGenerator,
+  // Default keyGenerator uses req.ip with proper IPv6 handling
   message: 'Too many webhook requests.',
 });
-

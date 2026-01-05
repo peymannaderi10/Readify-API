@@ -21,33 +21,67 @@ const MAX_CHANGE_TEXT_LENGTH = 10000;  // Max text per change
 const MAX_NOTE_CONTENT_LENGTH = 50000; // Max content per note
 
 /**
+ * Schema for segment within a change (text selection segment)
+ */
+const segmentSchema = z.object({
+  text: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  xpath: z.string().max(2000).optional(),
+  startOffset: z.number().int().min(0).optional(),
+  endOffset: z.number().int().min(0).optional(),
+}).passthrough();
+
+/**
  * Schema for individual text change/highlight (OWASP: Strict type validation)
+ * Matches the actual structure from the extension:
+ * { type, data, markId, highlightId, text, segments, noteText, createdAt }
  */
 const changeSchema = z.object({
-  id: z.string().max(100),
+  // Core identifiers - at least one should be present
+  markId: z.string().max(100).optional(),
+  highlightId: z.string().max(100).optional(),
+  
+  // Change type and data
+  type: z.string().max(50).optional(), // 'highlight', 'underline', etc.
+  data: z.union([z.string().max(50), z.null()]).optional(), // color or null
+  
+  // Text content
+  text: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  noteText: z.union([z.string().max(MAX_NOTE_CONTENT_LENGTH), z.null()]).optional(),
+  
+  // Segments array for multi-part selections
+  segments: z.array(segmentSchema).max(100).optional(),
+  
+  // Timestamp
+  createdAt: z.number().optional(),
+  
+  // Legacy fields (for backwards compatibility)
   originalText: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
   modifiedText: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
-  type: z.enum(['highlight', 'underline', 'strikethrough', 'custom']).optional(),
   color: z.string().max(50).optional(),
   timestamp: z.union([z.string(), z.number()]).optional(),
-  xpath: z.string().max(1000).optional(),
+  xpath: z.string().max(2000).optional(),
   textOffset: z.number().int().min(0).optional(),
-  textLength: z.number().int().min(0).max(MAX_CHANGE_TEXT_LENGTH).optional(),
-}).passthrough(); // Allow additional fields for backwards compatibility
+  textLength: z.number().int().min(0).optional(),
+}).passthrough(); // Allow additional fields for forwards compatibility
 
 /**
  * Schema for individual note (OWASP: Strict type validation)
+ * Notes are stored as a record with markId as key
  */
 const noteSchema = z.object({
-  id: z.string().max(100),
+  // Note can have various structures, be permissive but limit sizes
+  id: z.string().max(100).optional(),
+  markId: z.string().max(100).optional(),
   content: z.string().max(MAX_NOTE_CONTENT_LENGTH).optional(),
   text: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  noteText: z.string().max(MAX_NOTE_CONTENT_LENGTH).optional(),
   timestamp: z.union([z.string(), z.number()]).optional(),
+  createdAt: z.number().optional(),
   position: z.object({
     x: z.number().optional(),
     y: z.number().optional(),
   }).optional(),
-}).passthrough(); // Allow additional fields for backwards compatibility
+}).passthrough(); // Allow additional fields for forwards compatibility
 
 // ============================================
 // POST /sites/save
