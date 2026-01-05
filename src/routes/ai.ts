@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { openai, CHAT_MODEL, REALTIME_MODEL } from '../lib/openai.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requirePremium } from '../middleware/auth.js';
 import { AppError } from '../middleware/error.js';
 import { env } from '../config/env.js';
 
@@ -21,7 +21,7 @@ const chatSchema = z.object({
   })).optional(),
 });
 
-router.post('/chat', requireAuth, async (req: Request, res: Response): Promise<void> => {
+router.post('/chat', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = chatSchema.parse(req.body);
     const { message, pageContent, pageTitle, pageUrl, history = [] } = body;
@@ -106,7 +106,7 @@ const realtimeTokenSchema = z.object({
   voice: z.string().optional(),
 });
 
-router.post('/realtime-token', requireAuth, async (req: Request, res: Response): Promise<void> => {
+router.post('/realtime-token', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = realtimeTokenSchema.parse(req.body);
     const { pageContent, pageTitle, pageUrl, voice = 'verse' } = body;
@@ -197,7 +197,7 @@ const ttsSchema = z.object({
   speed: z.number().min(0.25).max(4.0).optional(),
 });
 
-router.post('/tts', requireAuth, async (req: Request, res: Response): Promise<void> => {
+router.post('/tts', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = ttsSchema.parse(req.body);
     const { text, voice = 'nova', speed = 1.0 } = body;

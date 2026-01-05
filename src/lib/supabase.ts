@@ -23,12 +23,12 @@ export async function verifyToken(token: string): Promise<User | null> {
   }
 }
 
-// Get user's subscription status
+// Get user's subscription status from user_profiles table
 export async function getUserSubscription(userId: string) {
   const { data, error } = await supabaseAdmin
-    .from('subscriptions')
-    .select('*')
-    .eq('user_id', userId)
+    .from('user_profiles')
+    .select('subscription_status, stripe_customer_id, stripe_subscription_id, cancelled_at, subscription_ends_at')
+    .eq('id', userId)
     .single();
 
   if (error && error.code !== 'PGRST116') { // PGRST116 = no rows
@@ -41,10 +41,39 @@ export async function getUserSubscription(userId: string) {
 
 // Check if user has premium subscription
 export async function isPremiumUser(userId: string): Promise<boolean> {
-  const subscription = await getUserSubscription(userId);
+  const profile = await getUserSubscription(userId);
   
-  if (!subscription) return false;
+  if (!profile) return false;
   
-  return subscription.status === 'active' || subscription.status === 'trialing';
+  const status = profile.subscription_status;
+  // 'active', 'trialing', 'canceling' all have premium access
+  // 'canceling' means cancelled but still within paid period
+  return ['active', 'trialing', 'canceling'].includes(status);
+}
+
+// Get full subscription details for API response
+export async function getSubscriptionDetails(userId: string) {
+  const profile = await getUserSubscription(userId);
+  
+  if (!profile) {
+    return {
+      status: 'free',
+      isPremium: false,
+      canAccessPremiumFeatures: false,
+    };
+  }
+  
+  const status = profile.subscription_status || 'free';
+  const isPremium = ['active', 'trialing', 'canceling'].includes(status);
+  
+  return {
+    status,
+    isPremium,
+    canAccessPremiumFeatures: isPremium,
+    stripeCustomerId: profile.stripe_customer_id,
+    stripeSubscriptionId: profile.stripe_subscription_id,
+    cancelledAt: profile.cancelled_at,
+    subscriptionEndsAt: profile.subscription_ends_at,
+  };
 }
 

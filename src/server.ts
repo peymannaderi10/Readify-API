@@ -11,6 +11,7 @@ import healthRoutes from './routes/health.js';
 import stripeRoutes from './routes/stripe.js';
 import sitesRoutes from './routes/sites.js';
 import aiRoutes from './routes/ai.js';
+import subscriptionRoutes from './routes/subscription.js';
 
 export function createApp() {
   const app: Express = express();
@@ -58,6 +59,7 @@ export function createApp() {
   app.use('/api/stripe', stripeRoutes);
   app.use('/api/sites', sitesRoutes);
   app.use('/api/ai', aiRoutes);
+  app.use('/api/subscription', subscriptionRoutes);
 
   // Root endpoint
   app.get('/', (_req: Request, res: Response) => {
@@ -78,7 +80,16 @@ export function createApp() {
   return app;
 }
 
+let started = false;
+
 export function startServer() {
+  // Prevent double-start with tsx watch/hot reload
+  if (started) {
+    console.log('⚠️ Server already started, skipping...');
+    return;
+  }
+  started = true;
+
   const app = createApp();
   const server = createServer(app);
 
