@@ -261,7 +261,7 @@ router.post('/tts', aiRateLimiter, requireAuth, requirePremium, async (req: Requ
     const { text, voice = 'nova', speed = 1.0 } = body;
 
     const mp3Response = await openai.audio.speech.create({
-      model: 'tts-1',
+      model: 'gpt-4o-mini-tts',
       voice: voice,
       input: text,
       speed: speed,
