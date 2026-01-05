@@ -13,6 +13,7 @@ import stripeRoutes from './routes/stripe.js';
 import sitesRoutes from './routes/sites.js';
 import aiRoutes from './routes/ai.js';
 import subscriptionRoutes from './routes/subscription.js';
+import usageRoutes from './routes/usage.js';
 
 export function createApp() {
   const app: Express = express();
@@ -66,6 +67,7 @@ export function createApp() {
   app.use('/api/sites', sitesRoutes);
   app.use('/api/ai', aiRoutes);
   app.use('/api/subscription', subscriptionRoutes);
+  app.use('/api/usage', usageRoutes);
 
   // Root endpoint
   app.get('/', (_req: Request, res: Response) => {

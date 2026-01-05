@@ -1,10 +1,12 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { openai, CHAT_MODEL, REALTIME_MODEL } from '../lib/openai.js';
-import { requireAuth, requirePremium } from '../middleware/auth.js';
+import { requireAuth } from '../middleware/auth.js';
+import { isPremiumUser } from '../lib/supabase.js';
 import { AppError } from '../middleware/error.js';
 import { env } from '../config/env.js';
 import { aiRateLimiter } from '../middleware/rate-limit.js';
+import { recordTokenUsage, checkFeatureLimit, getCurrentLimits, DEFAULT_LIMITS, Endpoint } from '../lib/token-tracker.js';
 
 const router = Router();
 
@@ -17,6 +19,92 @@ const MAX_TITLE_LENGTH = 500;           // Max page title
 const MAX_URL_LENGTH = 2048;            // Standard max URL length
 const MAX_HISTORY_ITEMS = 50;           // Max conversation history items
 const MAX_HISTORY_CONTENT_LENGTH = 4000; // Max content per history item
+
+// Note: Realtime usage is tracked client-side from WebSocket events
+// and reported via POST /usage/record-realtime when session ends
+
+// ============================================
+// Extend Request type to include token quota info
+// ============================================
+declare global {
+  namespace Express {
+    interface Request {
+      tokenQuota?: {
+        allowed: boolean;
+        remaining: number;
+        limit: number;
+        used: number;
+        percentUsed: number;
+        isWarning: boolean;
+        resetDate: string;
+      };
+      isPremiumUser?: boolean;
+      currentEndpoint?: Endpoint;
+    }
+  }
+}
+
+// ============================================
+// Per-Feature Token Quota Middleware Factory
+// ============================================
+/**
+ * Creates a middleware that checks quota for a specific endpoint
+ */
+function createQuotaChecker(endpoint: Endpoint) {
+  return async function checkQuota(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      if (!req.user) {
+        res.status(401).json({
+          error: 'Authentication required',
+          code: 'AUTH_REQUIRED',
+        });
+        return;
+      }
+
+      const isPremium = await isPremiumUser(req.user.id);
+      const featureCheck = await checkFeatureLimit(req.user.id, isPremium, endpoint);
+
+      // Attach to request for use in route handlers
+      req.tokenQuota = featureCheck;
+      req.isPremiumUser = isPremium;
+      req.currentEndpoint = endpoint;
+
+      if (!featureCheck.allowed) {
+        const allLimits = await getCurrentLimits();
+        const limits = isPremium ? allLimits.premium : allLimits.free;
+        res.status(429).json({
+          error: `Monthly ${endpoint} limit reached`,
+          code: 'TOKEN_LIMIT_REACHED',
+          endpoint: endpoint,
+          limit: featureCheck.limit,
+          used: featureCheck.used,
+          remaining: 0,
+          resetDate: featureCheck.resetDate,
+          upgrade: !isPremium,
+          tier: isPremium ? 'premium' : 'free',
+          // Include info about other features (they might have quota left)
+          otherLimits: {
+            chat: limits.chat,
+            tts: limits.tts,
+            realtime: limits.realtime,
+          },
+        });
+        return;
+      }
+
+      next();
+    } catch (error) {
+      console.error(`${endpoint} quota check error:`, error);
+      // On error, allow the request to proceed but log it
+      next();
+    }
+  };
+}
+
+// Create endpoint-specific middleware
+const checkChatQuota = createQuotaChecker('chat');
+const checkTTSQuota = createQuotaChecker('tts');
+const checkRealtimeQuota = createQuotaChecker('realtime');
 
 // ============================================
 // POST /ai/chat - Streaming text chat with SSE
@@ -47,8 +135,12 @@ const chatSchema = z.object({
   })).max(MAX_HISTORY_ITEMS, `History cannot exceed ${MAX_HISTORY_ITEMS} messages`).optional(),
 }).strict(); // Reject unexpected fields
 
-// Apply AI-specific rate limiting (20 req/min) + auth + premium check
-router.post('/chat', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+// Apply AI-specific rate limiting (20 req/min) + auth + CHAT quota check
+router.post('/chat', aiRateLimiter, requireAuth, checkChatQuota, async (req: Request, res: Response): Promise<void> => {
+  let totalTokens = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+
   try {
     const body = chatSchema.parse(req.body);
     const { message, pageContent, pageTitle, pageUrl, history = [] } = body;
@@ -85,13 +177,14 @@ ${pageContent.substring(0, 50000)}`;
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
 
-    // Create streaming completion
+    // Create streaming completion with usage tracking
     const stream = await openai.chat.completions.create({
       model: CHAT_MODEL,
       messages,
       max_tokens: 1024,
       temperature: 0.7,
       stream: true,
+      stream_options: { include_usage: true }, // Get token counts in stream
     });
 
     // Stream chunks to client
@@ -100,10 +193,44 @@ ${pageContent.substring(0, 50000)}`;
       if (content) {
         res.write(`data: ${JSON.stringify({ content })}\n\n`);
       }
+      
+      // Capture usage from final chunk (OpenAI sends it in the last chunk)
+      if (chunk.usage) {
+        totalTokens = chunk.usage.total_tokens;
+        promptTokens = chunk.usage.prompt_tokens;
+        completionTokens = chunk.usage.completion_tokens;
+      }
     }
 
-    // Send done event
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    // Record token usage after stream completes
+    if (totalTokens > 0 && req.user) {
+      await recordTokenUsage({
+        userId: req.user.id,
+        tokensUsed: totalTokens,
+        promptTokens,
+        completionTokens,
+        model: CHAT_MODEL,
+        endpoint: 'chat',
+      });
+    }
+
+    // Calculate updated usage for client
+    const newUsed = (req.tokenQuota?.used || 0) + totalTokens;
+    const limit = req.tokenQuota?.limit || (req.isPremiumUser ? DEFAULT_LIMITS.premium.chat : DEFAULT_LIMITS.free.chat);
+    const percentUsed = Math.round((newUsed / limit) * 100);
+
+    // Send done event with usage info
+    res.write(`data: ${JSON.stringify({ 
+      done: true,
+      usage: {
+        tokens: totalTokens,
+        totalUsed: newUsed,
+        limit: limit,
+        percentUsed: percentUsed,
+        isWarning: percentUsed >= 80,
+        endpoint: 'chat',
+      }
+    })}\n\n`);
     res.end();
 
   } catch (error) {
@@ -147,8 +274,8 @@ const realtimeTokenSchema = z.object({
     .default('verse'),
 }).strict(); // Reject unexpected fields
 
-// Apply AI-specific rate limiting (20 req/min) + auth + premium check
-router.post('/realtime-token', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+// Apply AI-specific rate limiting (20 req/min) + auth + REALTIME quota check
+router.post('/realtime-token', aiRateLimiter, requireAuth, checkRealtimeQuota, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = realtimeTokenSchema.parse(req.body);
     const { pageContent, pageTitle, pageUrl, voice = 'verse' } = body;
@@ -210,6 +337,14 @@ ${pageContent.substring(0, 50000)}`;
       expires_at?: number;
     };
 
+    // Note: We no longer record upfront session cost here
+    // Actual usage is tracked by the client from WebSocket response.done events
+    // and reported via POST /usage/record-realtime when session ends
+
+    // Calculate current usage for client
+    const currentUsed = req.tokenQuota?.used || 0;
+    const limit = req.tokenQuota?.limit || (req.isPremiumUser ? DEFAULT_LIMITS.premium.realtime : DEFAULT_LIMITS.free.realtime);
+
     // Return the ephemeral token and session config
     res.json({
       success: true,
@@ -218,6 +353,14 @@ ${pageContent.substring(0, 50000)}`;
       model: REALTIME_MODEL,
       voice: voice,
       expires_at: sessionData.client_secret.expires_at,
+      usage: {
+        tokens: 0,
+        totalUsed: currentUsed,
+        limit: limit,
+        percentUsed: Math.round((currentUsed / limit) * 100),
+        endpoint: 'realtime',
+        note: 'Actual usage tracked during conversation via WebSocket.',
+      },
     });
 
   } catch (error) {
@@ -231,7 +374,7 @@ ${pageContent.substring(0, 50000)}`;
 });
 
 // ============================================
-// POST /ai/tts - Text-to-speech (optional endpoint)
+// POST /ai/tts - Text-to-speech
 // ============================================
 
 /**
@@ -254,8 +397,8 @@ const ttsSchema = z.object({
     .default(1.0),
 }).strict(); // Reject unexpected fields
 
-// Apply AI-specific rate limiting (20 req/min) + auth + premium check
-router.post('/tts', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+// Apply AI-specific rate limiting (20 req/min) + auth + TTS quota check
+router.post('/tts', aiRateLimiter, requireAuth, checkTTSQuota, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = ttsSchema.parse(req.body);
     const { text, voice = 'nova', speed = 1.0 } = body;
@@ -270,8 +413,28 @@ router.post('/tts', aiRateLimiter, requireAuth, requirePremium, async (req: Requ
     // Get the audio as a buffer
     const buffer = Buffer.from(await mp3Response.arrayBuffer());
 
+    // TTS is billed per character, so we track character count
+    const charsUsed = text.length;
+
+    // Record character usage (stored in tokens_used column for simplicity)
+    if (req.user) {
+      await recordTokenUsage({
+        userId: req.user.id,
+        tokensUsed: charsUsed, // For TTS, this is character count
+        model: 'gpt-4o-mini-tts',
+        endpoint: 'tts',
+      });
+    }
+
+    // Calculate updated usage for client
+    const newUsed = (req.tokenQuota?.used || 0) + charsUsed;
+    const limit = req.tokenQuota?.limit || (req.isPremiumUser ? DEFAULT_LIMITS.premium.tts : DEFAULT_LIMITS.free.tts);
+
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Length', buffer.length);
+    res.setHeader('X-TTS-Chars-Used', charsUsed.toString());
+    res.setHeader('X-TTS-Total-Used', newUsed.toString());
+    res.setHeader('X-TTS-Limit', limit.toString());
     res.send(buffer);
 
   } catch (error) {
@@ -284,4 +447,3 @@ router.post('/tts', aiRateLimiter, requireAuth, requirePremium, async (req: Requ
 });
 
 export default router;
-
