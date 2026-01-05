@@ -20,8 +20,10 @@ const envSchema = z.object({
   STRIPE_WEBHOOK_SECRET: z.string().min(1),
   STRIPE_PRICE_ID: z.string().min(1),
 
-  // OpenAI (optional for now)
-  OPENAI_API_KEY: z.string().optional(),
+  // OpenAI
+  OPENAI_API_KEY: z.string().min(1),
+  OPENAI_CHAT_MODEL: z.string().default('gpt-4o-mini'),
+  OPENAI_REALTIME_MODEL: z.string().default('gpt-4o-realtime-preview-2024-12-17'),
 
   // CORS
   FRONTEND_URL: z.string().optional(),

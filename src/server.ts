@@ -10,6 +10,7 @@ import { setupWebSocket } from './websocket/handler.js';
 import healthRoutes from './routes/health.js';
 import stripeRoutes from './routes/stripe.js';
 import sitesRoutes from './routes/sites.js';
+import aiRoutes from './routes/ai.js';
 
 export function createApp() {
   const app: Express = express();
@@ -56,6 +57,7 @@ export function createApp() {
   app.use('/health', healthRoutes);
   app.use('/api/stripe', stripeRoutes);
   app.use('/api/sites', sitesRoutes);
+  app.use('/api/ai', aiRoutes);
 
   // Root endpoint
   app.get('/', (_req: Request, res: Response) => {
