@@ -3,24 +3,87 @@ import { z } from 'zod';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/error.js';
+import { apiRateLimiter, strictApiRateLimiter } from '../middleware/rate-limit.js';
 
 const router = Router();
 
 const FREE_SITE_LIMIT = 5;
 
 // ============================================
+// VALIDATION CONSTANTS (OWASP: Define reasonable limits)
+// ============================================
+const MAX_URL_DIGEST_LENGTH = 128;     // SHA-256 hex = 64 chars, allow some buffer
+const MAX_URL_LENGTH = 2048;           // Standard max URL length
+const MAX_TITLE_LENGTH = 500;          // Max page title
+const MAX_HOSTNAME_LENGTH = 255;       // Max DNS hostname length
+const MAX_CHANGES_COUNT = 1000;        // Max number of changes per site
+const MAX_CHANGE_TEXT_LENGTH = 10000;  // Max text per change
+const MAX_NOTE_CONTENT_LENGTH = 50000; // Max content per note
+
+/**
+ * Schema for individual text change/highlight (OWASP: Strict type validation)
+ */
+const changeSchema = z.object({
+  id: z.string().max(100),
+  originalText: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  modifiedText: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  type: z.enum(['highlight', 'underline', 'strikethrough', 'custom']).optional(),
+  color: z.string().max(50).optional(),
+  timestamp: z.union([z.string(), z.number()]).optional(),
+  xpath: z.string().max(1000).optional(),
+  textOffset: z.number().int().min(0).optional(),
+  textLength: z.number().int().min(0).max(MAX_CHANGE_TEXT_LENGTH).optional(),
+}).passthrough(); // Allow additional fields for backwards compatibility
+
+/**
+ * Schema for individual note (OWASP: Strict type validation)
+ */
+const noteSchema = z.object({
+  id: z.string().max(100),
+  content: z.string().max(MAX_NOTE_CONTENT_LENGTH).optional(),
+  text: z.string().max(MAX_CHANGE_TEXT_LENGTH).optional(),
+  timestamp: z.union([z.string(), z.number()]).optional(),
+  position: z.object({
+    x: z.number().optional(),
+    y: z.number().optional(),
+  }).optional(),
+}).passthrough(); // Allow additional fields for backwards compatibility
+
+// ============================================
 // POST /sites/save
 // ============================================
-const saveSiteSchema = z.object({
-  url_digest: z.string(),
-  url: z.string().optional(),
-  title: z.string().optional(),
-  hostname: z.string().optional(),
-  changes: z.array(z.any()).optional(),
-  notes: z.record(z.any()).optional(),
-});
 
-router.post('/save', requireAuth, async (req: Request, res: Response): Promise<void> => {
+/**
+ * Save site schema with strict validation (OWASP: Input Validation)
+ * - All fields have explicit type checks and length limits
+ * - Nested objects are validated with their own schemas
+ * - Arrays have count limits to prevent DoS
+ */
+const saveSiteSchema = z.object({
+  url_digest: z.string()
+    .min(1, 'URL digest is required')
+    .max(MAX_URL_DIGEST_LENGTH, `URL digest cannot exceed ${MAX_URL_DIGEST_LENGTH} characters`)
+    .regex(/^[a-zA-Z0-9_-]+$/, 'URL digest must be alphanumeric'),
+  url: z.string()
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
+  title: z.string()
+    .max(MAX_TITLE_LENGTH, `Title cannot exceed ${MAX_TITLE_LENGTH} characters`)
+    .optional(),
+  hostname: z.string()
+    .max(MAX_HOSTNAME_LENGTH, `Hostname cannot exceed ${MAX_HOSTNAME_LENGTH} characters`)
+    .optional(),
+  changes: z.array(changeSchema)
+    .max(MAX_CHANGES_COUNT, `Cannot exceed ${MAX_CHANGES_COUNT} changes per site`)
+    .optional(),
+  notes: z.record(
+    z.string().max(100), // Note ID as key
+    noteSchema
+  ).optional(),
+}).strict(); // Reject unexpected fields
+
+// Apply strict rate limiting (30 req/min) for write operations + auth
+router.post('/save', strictApiRateLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = saveSiteSchema.parse(req.body);
     const user = req.user!;
@@ -89,7 +152,8 @@ router.post('/save', requireAuth, async (req: Request, res: Response): Promise<v
 // ============================================
 // GET /sites/list
 // ============================================
-router.get('/list', requireAuth, async (req: Request, res: Response) => {
+// Apply standard rate limiting (60 req/min) for read operations + auth
+router.get('/list', apiRateLimiter, requireAuth, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
 
@@ -118,10 +182,26 @@ router.get('/list', requireAuth, async (req: Request, res: Response) => {
 // ============================================
 // GET /sites/:urlDigest
 // ============================================
-router.get('/:urlDigest', requireAuth, async (req: Request, res: Response): Promise<void> => {
+
+/**
+ * URL param validation schema (OWASP: Validate all input including route params)
+ */
+const urlDigestParamSchema = z.string()
+  .min(1, 'URL digest is required')
+  .max(MAX_URL_DIGEST_LENGTH, `URL digest cannot exceed ${MAX_URL_DIGEST_LENGTH} characters`)
+  .regex(/^[a-zA-Z0-9_-]+$/, 'URL digest must be alphanumeric');
+
+// Apply standard rate limiting (60 req/min) for read operations + auth
+router.get('/:urlDigest', apiRateLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const user = req.user!;
-    const { urlDigest } = req.params;
+    
+    // Validate URL parameter (OWASP: Never trust user input, including route params)
+    const urlDigestResult = urlDigestParamSchema.safeParse(req.params.urlDigest);
+    if (!urlDigestResult.success) {
+      throw new AppError('Invalid URL digest parameter', 400, 'VALIDATION_ERROR');
+    }
+    const urlDigest = urlDigestResult.data;
 
     const { data, error } = await supabaseAdmin
       .from('user_sites')
@@ -156,10 +236,17 @@ router.get('/:urlDigest', requireAuth, async (req: Request, res: Response): Prom
 // ============================================
 // DELETE /sites/:urlDigest
 // ============================================
-router.delete('/:urlDigest', requireAuth, async (req: Request, res: Response) => {
+// Apply strict rate limiting (30 req/min) for delete operations + auth
+router.delete('/:urlDigest', strictApiRateLimiter, requireAuth, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
-    const { urlDigest } = req.params;
+    
+    // Validate URL parameter (OWASP: Never trust user input, including route params)
+    const urlDigestResult = urlDigestParamSchema.safeParse(req.params.urlDigest);
+    if (!urlDigestResult.success) {
+      throw new AppError('Invalid URL digest parameter', 400, 'VALIDATION_ERROR');
+    }
+    const urlDigest = urlDigestResult.data;
 
     const { error } = await supabaseAdmin
       .from('user_sites')

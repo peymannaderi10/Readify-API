@@ -4,24 +4,51 @@ import { openai, CHAT_MODEL, REALTIME_MODEL } from '../lib/openai.js';
 import { requireAuth, requirePremium } from '../middleware/auth.js';
 import { AppError } from '../middleware/error.js';
 import { env } from '../config/env.js';
+import { aiRateLimiter } from '../middleware/rate-limit.js';
 
 const router = Router();
 
 // ============================================
+// VALIDATION CONSTANTS (OWASP: Define reasonable limits)
+// ============================================
+const MAX_MESSAGE_LENGTH = 4000;        // Max user message length
+const MAX_PAGE_CONTENT_LENGTH = 100000; // Max page content (~100KB of text)
+const MAX_TITLE_LENGTH = 500;           // Max page title
+const MAX_URL_LENGTH = 2048;            // Standard max URL length
+const MAX_HISTORY_ITEMS = 50;           // Max conversation history items
+const MAX_HISTORY_CONTENT_LENGTH = 4000; // Max content per history item
+
+// ============================================
 // POST /ai/chat - Streaming text chat with SSE
 // ============================================
+
+/**
+ * Chat request schema with strict validation (OWASP: Input Validation)
+ * - All string fields have max length limits to prevent memory exhaustion
+ * - .strict() rejects any unexpected fields
+ * - History array is limited in both count and content size
+ */
 const chatSchema = z.object({
-  message: z.string().min(1),
-  pageContent: z.string().optional(),
-  pageTitle: z.string().optional(),
-  pageUrl: z.string().optional(),
+  message: z.string()
+    .min(1, 'Message cannot be empty')
+    .max(MAX_MESSAGE_LENGTH, `Message cannot exceed ${MAX_MESSAGE_LENGTH} characters`),
+  pageContent: z.string()
+    .max(MAX_PAGE_CONTENT_LENGTH, `Page content cannot exceed ${MAX_PAGE_CONTENT_LENGTH} characters`)
+    .optional(),
+  pageTitle: z.string()
+    .max(MAX_TITLE_LENGTH, `Page title cannot exceed ${MAX_TITLE_LENGTH} characters`)
+    .optional(),
+  pageUrl: z.string()
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
   history: z.array(z.object({
     role: z.enum(['user', 'assistant']),
-    content: z.string(),
-  })).optional(),
-});
+    content: z.string().max(MAX_HISTORY_CONTENT_LENGTH),
+  })).max(MAX_HISTORY_ITEMS, `History cannot exceed ${MAX_HISTORY_ITEMS} messages`).optional(),
+}).strict(); // Reject unexpected fields
 
-router.post('/chat', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+// Apply AI-specific rate limiting (20 req/min) + auth + premium check
+router.post('/chat', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = chatSchema.parse(req.body);
     const { message, pageContent, pageTitle, pageUrl, history = [] } = body;
@@ -99,14 +126,29 @@ ${pageContent.substring(0, 50000)}`;
 // ============================================
 // POST /ai/realtime-token - Get ephemeral token for Realtime API
 // ============================================
-const realtimeTokenSchema = z.object({
-  pageContent: z.string().optional(),
-  pageTitle: z.string().optional(),
-  pageUrl: z.string().optional(),
-  voice: z.string().optional(),
-});
 
-router.post('/realtime-token', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+/**
+ * Realtime token request schema with strict validation (OWASP: Input Validation)
+ * - Voice is restricted to known valid values
+ * - All optional strings have length limits
+ */
+const realtimeTokenSchema = z.object({
+  pageContent: z.string()
+    .max(MAX_PAGE_CONTENT_LENGTH, `Page content cannot exceed ${MAX_PAGE_CONTENT_LENGTH} characters`)
+    .optional(),
+  pageTitle: z.string()
+    .max(MAX_TITLE_LENGTH, `Page title cannot exceed ${MAX_TITLE_LENGTH} characters`)
+    .optional(),
+  pageUrl: z.string()
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
+  voice: z.enum(['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'])
+    .optional()
+    .default('verse'),
+}).strict(); // Reject unexpected fields
+
+// Apply AI-specific rate limiting (20 req/min) + auth + premium check
+router.post('/realtime-token', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = realtimeTokenSchema.parse(req.body);
     const { pageContent, pageTitle, pageUrl, voice = 'verse' } = body;
@@ -191,13 +233,29 @@ ${pageContent.substring(0, 50000)}`;
 // ============================================
 // POST /ai/tts - Text-to-speech (optional endpoint)
 // ============================================
-const ttsSchema = z.object({
-  text: z.string().min(1).max(4096),
-  voice: z.enum(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']).optional(),
-  speed: z.number().min(0.25).max(4.0).optional(),
-});
 
-router.post('/tts', requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
+/**
+ * TTS request schema with strict validation (OWASP: Input Validation)
+ * - Text has strict min/max limits
+ * - Voice is restricted to OpenAI's valid voices
+ * - Speed is bounded to valid range
+ */
+const ttsSchema = z.object({
+  text: z.string()
+    .min(1, 'Text cannot be empty')
+    .max(4096, 'Text cannot exceed 4096 characters'),
+  voice: z.enum(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'])
+    .optional()
+    .default('nova'),
+  speed: z.number()
+    .min(0.25, 'Speed must be at least 0.25')
+    .max(4.0, 'Speed cannot exceed 4.0')
+    .optional()
+    .default(1.0),
+}).strict(); // Reject unexpected fields
+
+// Apply AI-specific rate limiting (20 req/min) + auth + premium check
+router.post('/tts', aiRateLimiter, requireAuth, requirePremium, async (req: Request, res: Response): Promise<void> => {
   try {
     const body = ttsSchema.parse(req.body);
     const { text, voice = 'nova', speed = 1.0 } = body;

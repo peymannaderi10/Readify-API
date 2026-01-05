@@ -1,13 +1,15 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getSubscriptionDetails } from '../lib/supabase.js';
+import { apiRateLimiter } from '../middleware/rate-limit.js';
 
 const router = Router();
 
 // ============================================
 // GET /subscription/status - Check user's subscription status
 // ============================================
-router.get('/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
+// Apply standard rate limiting (60 req/min) + auth
+router.get('/status', apiRateLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     

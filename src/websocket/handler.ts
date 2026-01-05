@@ -4,6 +4,68 @@ import { Server } from 'http';
 import { verifyToken } from '../lib/supabase.js';
 import { User } from '@supabase/supabase-js';
 
+// ============================================
+// WEBSOCKET RATE LIMITING (OWASP: Prevent abuse)
+// ============================================
+const WS_MAX_MESSAGES_PER_MINUTE = 60;    // Max messages per minute per user
+const WS_MAX_MESSAGE_SIZE = 65536;         // Max message size (64KB)
+const WS_CONNECTION_LIMIT_PER_USER = 3;    // Max concurrent connections per user
+
+// Track message counts for rate limiting (userId -> { count, resetTime })
+const messageRateLimits = new Map<string, { count: number; resetTime: number }>();
+
+// Track connections per user for connection limiting
+const userConnectionCounts = new Map<string, number>();
+
+/**
+ * Check if a user is rate limited for WebSocket messages
+ */
+function isRateLimited(userId: string): boolean {
+  const now = Date.now();
+  const limit = messageRateLimits.get(userId);
+  
+  if (!limit || now >= limit.resetTime) {
+    // Reset or initialize rate limit window
+    messageRateLimits.set(userId, { count: 1, resetTime: now + 60000 });
+    return false;
+  }
+  
+  if (limit.count >= WS_MAX_MESSAGES_PER_MINUTE) {
+    return true;
+  }
+  
+  limit.count++;
+  return false;
+}
+
+/**
+ * Check if user has too many concurrent connections
+ */
+function canConnect(userId: string): boolean {
+  const count = userConnectionCounts.get(userId) || 0;
+  return count < WS_CONNECTION_LIMIT_PER_USER;
+}
+
+/**
+ * Track a new connection for a user
+ */
+function trackConnection(userId: string): void {
+  const count = userConnectionCounts.get(userId) || 0;
+  userConnectionCounts.set(userId, count + 1);
+}
+
+/**
+ * Untrack a connection when it closes
+ */
+function untrackConnection(userId: string): void {
+  const count = userConnectionCounts.get(userId) || 0;
+  if (count > 1) {
+    userConnectionCounts.set(userId, count - 1);
+  } else {
+    userConnectionCounts.delete(userId);
+  }
+}
+
 // Extended WebSocket type with user info
 interface AuthenticatedWebSocket extends WebSocket {
   user?: User;
@@ -23,6 +85,8 @@ export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ 
     server,
     path: '/ws',
+    // OWASP: Limit message size to prevent memory exhaustion
+    maxPayload: WS_MAX_MESSAGE_SIZE,
   });
 
   console.log('🔌 WebSocket server initialized on /ws');
@@ -66,11 +130,19 @@ export function setupWebSocket(server: Server) {
       return;
     }
 
+    // OWASP: Check connection limit per user (prevent resource exhaustion)
+    if (!canConnect(user.id)) {
+      console.log(`WebSocket connection rejected: Too many connections for user ${user.email}`);
+      ws.close(4003, 'Too many connections');
+      return;
+    }
+
     // Attach user to WebSocket
     ws.user = user;
     ws.isAlive = true;
 
-    // Store connection
+    // Track and store connection
+    trackConnection(user.id);
     connections.set(user.id, ws);
     console.log(`WebSocket connected for user: ${user.email}`);
 
@@ -88,9 +160,21 @@ export function setupWebSocket(server: Server) {
       ws.isAlive = true;
     });
 
-    // Handle incoming messages
+    // Handle incoming messages with rate limiting (OWASP: Prevent abuse)
     ws.on('message', async (data: RawData) => {
       try {
+        // Check rate limit before processing
+        if (ws.user && isRateLimited(ws.user.id)) {
+          sendMessage(ws, {
+            type: 'error',
+            payload: { 
+              message: 'Rate limited. Please slow down.',
+              code: 'RATE_LIMITED',
+            },
+          });
+          return;
+        }
+
         const message = JSON.parse(data.toString()) as WSMessage;
         await handleMessage(ws, message);
       } catch (error) {
@@ -106,6 +190,7 @@ export function setupWebSocket(server: Server) {
     ws.on('close', () => {
       if (ws.user) {
         connections.delete(ws.user.id);
+        untrackConnection(ws.user.id);  // OWASP: Properly clean up connection tracking
         console.log(`WebSocket disconnected for user: ${ws.user.email}`);
       }
     });

@@ -6,19 +6,43 @@ import { requireAuth } from '../middleware/auth.js';
 import { AppError } from '../middleware/error.js';
 import { env } from '../config/env.js';
 import Stripe from 'stripe';
+import { stripeRateLimiter, webhookRateLimiter } from '../middleware/rate-limit.js';
 
 const router = Router();
 
 // ============================================
+// VALIDATION CONSTANTS (OWASP: Define reasonable limits)
+// ============================================
+const MAX_URL_LENGTH = 2048;           // Standard max URL length
+const MAX_PRICE_ID_LENGTH = 100;       // Stripe price IDs are typically short
+const MAX_SUBSCRIPTION_ID_LENGTH = 100; // Stripe subscription IDs
+
+// ============================================
 // POST /stripe/create-checkout-session
 // ============================================
-const checkoutSchema = z.object({
-  priceId: z.string().optional(),
-  successUrl: z.string().url().optional(),
-  cancelUrl: z.string().url().optional(),
-});
 
-router.post('/create-checkout-session', requireAuth, async (req: Request, res: Response) => {
+/**
+ * Checkout session schema with strict validation (OWASP: Input Validation)
+ * - URLs are validated and length-limited
+ * - Price ID is validated to prevent injection
+ */
+const checkoutSchema = z.object({
+  priceId: z.string()
+    .max(MAX_PRICE_ID_LENGTH, `Price ID cannot exceed ${MAX_PRICE_ID_LENGTH} characters`)
+    .regex(/^price_[a-zA-Z0-9]+$/, 'Invalid Stripe price ID format')
+    .optional(),
+  successUrl: z.string()
+    .url('Invalid success URL')
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
+  cancelUrl: z.string()
+    .url('Invalid cancel URL')
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
+}).strict(); // Reject unexpected fields
+
+// Apply Stripe-specific rate limiting (10 req/min) + auth
+router.post('/create-checkout-session', stripeRateLimiter, requireAuth, async (req: Request, res: Response) => {
   try {
     const body = checkoutSchema.parse(req.body);
     const user = req.user!;
@@ -83,11 +107,19 @@ router.post('/create-checkout-session', requireAuth, async (req: Request, res: R
 // ============================================
 // POST /stripe/create-portal-session
 // ============================================
-const portalSchema = z.object({
-  returnUrl: z.string().url().optional(),
-});
 
-router.post('/create-portal-session', requireAuth, async (req: Request, res: Response) => {
+/**
+ * Portal session schema with strict validation (OWASP: Input Validation)
+ */
+const portalSchema = z.object({
+  returnUrl: z.string()
+    .url('Invalid return URL')
+    .max(MAX_URL_LENGTH, `URL cannot exceed ${MAX_URL_LENGTH} characters`)
+    .optional(),
+}).strict(); // Reject unexpected fields
+
+// Apply Stripe-specific rate limiting (10 req/min) + auth
+router.post('/create-portal-session', stripeRateLimiter, requireAuth, async (req: Request, res: Response) => {
   try {
     const body = portalSchema.parse(req.body);
     const user = req.user!;
@@ -123,11 +155,20 @@ router.post('/create-portal-session', requireAuth, async (req: Request, res: Res
 // ============================================
 // POST /stripe/cancel-subscription
 // ============================================
-const cancelSchema = z.object({
-  subscriptionId: z.string(),
-});
 
-router.post('/cancel-subscription', requireAuth, async (req: Request, res: Response) => {
+/**
+ * Cancel subscription schema with strict validation (OWASP: Input Validation)
+ * - Subscription ID format is validated to prevent injection
+ */
+const cancelSchema = z.object({
+  subscriptionId: z.string()
+    .min(1, 'Subscription ID is required')
+    .max(MAX_SUBSCRIPTION_ID_LENGTH, `Subscription ID cannot exceed ${MAX_SUBSCRIPTION_ID_LENGTH} characters`)
+    .regex(/^sub_[a-zA-Z0-9]+$/, 'Invalid Stripe subscription ID format'),
+}).strict(); // Reject unexpected fields
+
+// Apply Stripe-specific rate limiting (10 req/min) + auth
+router.post('/cancel-subscription', stripeRateLimiter, requireAuth, async (req: Request, res: Response) => {
   try {
     const body = cancelSchema.parse(req.body);
     const user = req.user!;
@@ -200,7 +241,8 @@ router.post('/cancel-subscription', requireAuth, async (req: Request, res: Respo
 // ============================================
 // POST /stripe/webhook
 // ============================================
-router.post('/webhook', async (req: Request, res: Response) => {
+// Apply webhook rate limiting (100 req/min) - higher limit for Stripe's needs
+router.post('/webhook', webhookRateLimiter, async (req: Request, res: Response) => {
   const signature = req.headers['stripe-signature'];
 
   if (!signature) {

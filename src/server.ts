@@ -5,6 +5,7 @@ import { createServer } from 'http';
 import { env, isDev } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
 import { setupWebSocket } from './websocket/handler.js';
+import { globalRateLimiter } from './middleware/rate-limit.js';
 
 // Import routes
 import healthRoutes from './routes/health.js';
@@ -23,6 +24,11 @@ export function createApp() {
   app.use(helmet({
     contentSecurityPolicy: false, // Disable for API
   }));
+
+  // Global rate limiting - applies to ALL requests
+  // Protects against basic DoS attacks (OWASP recommendation)
+  // Limit: 100 requests per minute per IP
+  app.use(globalRateLimiter);
 
   // CORS configuration
   // Note: For Chrome extensions, content scripts run in the web page context,
